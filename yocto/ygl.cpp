@@ -4059,7 +4059,7 @@ bsdf eval_bsdf(const std::shared_ptr<instance>& ist, int ei, const vec2f& uv) {
 }
 
 // Evaluates the bssrdf at a location.
-bssrdf eval_bssrdf(const std::shared_ptr<instance>& ist, int ei, const vec2f& uv) {
+bssrdf eval_bssrdf(const std::shared_ptr<instance>& ist, int ei, const vec2f& uv, const vec3f& n, const vec3f&wo) {
 	auto f = bssrdf();
 	f.kd = eval_diffuse(ist, ei, uv);
 	f.ks = eval_specular(ist, ei, uv);
@@ -4067,6 +4067,10 @@ bssrdf eval_bssrdf(const std::shared_ptr<instance>& ist, int ei, const vec2f& uv
 	f.kr = ist->mat->kr;
 	f.sigma_a = ist->mat->sigma_a;
 	f.sigma_s = ist->mat->sigma_s;
+	f.eta = specular_to_eta(f.ks);
+	auto wi = refract(-wo, n, f.eta);
+	f.g = abs(dot(n, wo))/ abs(dot(n, wo));
+	f.mfp = 1.0f / (f.sigma_s + f.sigma_a);
 	f.rs = eval_roughness(ist, ei, uv);
 	f.refract = (ist && ist->mat) ? ist->mat->refract : false;
 	if (f.kd != zero3f) {
@@ -4543,7 +4547,7 @@ vec3f trace_path(const std::shared_ptr<scene>& scn, const ray3f& ray_,
         auto p = eval_pos(isec.ist, isec.ei, isec.uv);
         auto n = eval_shading_norm(isec.ist, isec.ei, isec.uv, o);
         auto f = eval_bsdf(isec.ist, isec.ei, isec.uv);
-		auto S = eval_bssrdf(isec.ist, isec.ei, isec.uv);
+		auto S = eval_bssrdf(isec.ist, isec.ei, isec.uv, n, o);
 
         // emission
         if (emission) l += weight * eval_emission(isec.ist, isec.ei, isec.uv);

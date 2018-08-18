@@ -3188,6 +3188,9 @@ struct bssrdf {
 	vec3f kr = zero3f;     // reflectance
 	vec3f sigma_a = zero3f;     // absortion
 	vec3f sigma_s = zero3f;     // scattering
+	vec3f mfp = { 0.1f, 0.1f, 0.1f };
+	float g = 0.0f; // Geometry factor
+	float eta = 0.0f;
 	float rs = 1;          // roughness
 	bool refract = false;  // whether to use refraction in transmission
 };
