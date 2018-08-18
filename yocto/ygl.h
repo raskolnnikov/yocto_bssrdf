@@ -2828,6 +2828,9 @@ struct material {
     vec3f kd = {0, 0, 0};  // diffuse/base color
     vec3f ks = {0, 0, 0};  // specular color / metallic factor
     vec3f kt = {0, 0, 0};  // transmission color
+	vec3f kr = { 0.44f, 0.22f, 0.13f }; // diffuse reflectance - mm^-1
+	vec3f sigma_s = { 0.74f, 0.88f, 1.01f }; // scattering coefficient
+	vec3f sigma_a = { 0.032f, 0.17f, 0.48f }; // absortion coefficient
     float rs = 0.0001;     // roughness mapped as glTF
     float op = 1;          // opacity
     bool fresnel = true;   // whether to use fresnel in reflections/transmission
@@ -3176,7 +3179,25 @@ struct bsdf {
     float rs = 1;          // roughness
     bool refract = false;  // whether to use refraction in transmission
 };
+
+// Material values packed into a convenience structure.
+struct bssrdf {
+	vec3f kd = zero3f;     // diffuse
+	vec3f ks = zero3f;     // specular
+	vec3f kt = zero3f;     // transmission
+	vec3f kr = zero3f;     // reflectance
+	vec3f sigma_a = zero3f;     // absortion
+	vec3f sigma_s = zero3f;     // scattering
+	float rs = 1;          // roughness
+	bool refract = false;  // whether to use refraction in transmission
+};
+
+
 bsdf eval_bsdf(const std::shared_ptr<instance>& ist, int ei, const vec2f& uv);
+
+bssrdf eval_bssrdf(const std::shared_ptr<instance>& ist, int ei, const vec2f& uv);
+
+
 bool is_delta_bsdf(const bsdf& f);
 
 // Sample a shape based on a distribution.

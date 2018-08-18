@@ -4057,6 +4057,27 @@ bsdf eval_bsdf(const std::shared_ptr<instance>& ist, int ei, const vec2f& uv) {
         f.rs = 0;
     return f;
 }
+
+// Evaluates the bssrdf at a location.
+bssrdf eval_bssrdf(const std::shared_ptr<instance>& ist, int ei, const vec2f& uv) {
+	auto f = bssrdf();
+	f.kd = eval_diffuse(ist, ei, uv);
+	f.ks = eval_specular(ist, ei, uv);
+	f.kt = eval_transmission(ist, ei, uv);
+	f.kr = ist->mat->kr;
+	f.sigma_a = ist->mat->sigma_a;
+	f.sigma_s = ist->mat->sigma_s;
+	f.rs = eval_roughness(ist, ei, uv);
+	f.refract = (ist && ist->mat) ? ist->mat->refract : false;
+	if (f.kd != zero3f) {
+		f.rs = clamp(f.rs, 0.03f * 0.03f, 1.0f);
+	}
+	else if (f.rs <= 0.03f * 0.03f)
+		f.rs = 0;
+	return f;
+}
+
+
 bool is_delta_bsdf(const bsdf& f) { return f.rs == 0 && f.kd == zero3f; }
 
 // Sample a shape based on a distribution.
@@ -4504,7 +4525,6 @@ vec3f trace_path(const std::shared_ptr<scene>& scn, const ray3f& ray_,
     auto weight = vec3f{1, 1, 1};
     auto emission = true;
     auto ray = ray_;
-
     // trace  path
     for (auto bounce = 0; bounce < nbounces; bounce++) {
         // intersect ray
@@ -4523,6 +4543,7 @@ vec3f trace_path(const std::shared_ptr<scene>& scn, const ray3f& ray_,
         auto p = eval_pos(isec.ist, isec.ei, isec.uv);
         auto n = eval_shading_norm(isec.ist, isec.ei, isec.uv, o);
         auto f = eval_bsdf(isec.ist, isec.ei, isec.uv);
+		auto S = eval_bssrdf(isec.ist, isec.ei, isec.uv);
 
         // emission
         if (emission) l += weight * eval_emission(isec.ist, isec.ei, isec.uv);
@@ -4594,6 +4615,12 @@ vec3f trace_path(const std::shared_ptr<scene>& scn, const ray3f& ray_,
         // setup next ray
         ray = make_ray(p, i);
         emission = is_delta_bsdf(f);
+
+		//Here goes subsurface scattering
+		/*
+		
+		
+		*/
     }
 
     return l;
