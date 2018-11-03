@@ -1,0 +1,27 @@
+newmtl floor_txt
+  illum 2
+  Kd 1 1 1
+  Ns 1
+  map_Kd grid.png
+
+newmtl plastic03
+  illum 2
+  Kd 0.192 0.192 0.48
+  Ks 0.04 0.04 0.04
+  Ns 19998
+
+newmtl matte00
+  illum 2
+  Kd 0.2 0.2 0.2
+  Ns 1
+
+newmtl arealight01
+  illum 2
+  Ke 80 80 80
+  Ns 1
+
+newmtl arealight02
+  illum 2
+  Ke 20 20 20
+  Ns 1
+

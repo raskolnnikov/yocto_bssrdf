@@ -632,6 +632,8 @@ template <typename T, typename T1>
 inline vec<T, 3> refract(const vec<T, 3>& w, const vec<T, 3>& n, T1 eta) {
     // auto k = 1.0 - eta * eta * (1.0 - dot(n, w) * dot(n, w));
     auto k = 1 - eta * eta * max((T)0, (T)1 - dot(n, w) * dot(n, w));
+	std::cout << "k = " << k << std::endl;
+
     if (k < 0) return vec<T, 3>();  // tir
     return -w * eta + (eta * dot(n, w) - sqrt(k)) * n;
 }
@@ -2829,7 +2831,7 @@ struct material {
     vec3f ks = {0, 0, 0};  // specular color / metallic factor
     vec3f kt = {0, 0, 0};  // transmission color
 	vec3f kr = { 0.44f, 0.22f, 0.13f }; // diffuse reflectance - mm^-1
-	vec3f sigma_s = { 0.74f, 0.88f, 1.01f }; // scattering coefficient
+	vec3f sigma_s = { 700.0f, 1000.88f, 1500.1f }; // scattering coefficient
 	vec3f sigma_a = { 0.032f, 0.17f, 0.48f }; // absortion coefficient
     float rs = 0.0001;     // roughness mapped as glTF
     float op = 1;          // opacity
@@ -3171,6 +3173,15 @@ float eval_roughness(
 float eval_opacity(
     const std::shared_ptr<instance>& ist, int ei, const vec2f& uv);
 
+struct ShadingGeometry {
+	vec3f sn = zero3f;
+	vec3f dpdu = zero3f;
+	vec3f dpdv = zero3f;
+};
+
+void eval_shading_geometry(const std::shared_ptr<instance>& ist, int ei, const vec2f& uv, vec3f n, vec3f p, ShadingGeometry *sg);
+
+
 // Material values packed into a convenience structure.
 struct bsdf {
     vec3f kd = zero3f;     // diffuse
@@ -3178,6 +3189,23 @@ struct bsdf {
     vec3f kt = zero3f;     // transmission
     float rs = 1;          // roughness
     bool refract = false;  // whether to use refraction in transmission
+};
+
+bsdf eval_bsdf(const std::shared_ptr<instance>& ist, int ei, const vec2f& uv);
+
+struct BSSRDFTable {
+	// BSSRDFTable Public Data
+	const int nRhoSamples, nRadiusSamples;
+	std::unique_ptr<float[]> rhoSamples, radiusSamples;
+	std::unique_ptr<float[]> profile;
+	std::unique_ptr<float[]> rhoEff;
+	std::unique_ptr<float[]> profileCDF;
+
+	// BSSRDFTable Public Methods
+	BSSRDFTable(int nRhoSamples, int nRadiusSamples);
+	inline float EvalProfile(int rhoIndex, int radiusIndex) const {
+		return profile[rhoIndex * nRadiusSamples + radiusIndex];
+	}
 };
 
 // Material values packed into a convenience structure.
@@ -3188,17 +3216,24 @@ struct bssrdf {
 	vec3f kr = zero3f;     // reflectance
 	vec3f sigma_a = zero3f;     // absortion
 	vec3f sigma_s = zero3f;     // scattering
+	vec3f sigma_t = zero3f;     // transmission
+	vec3f rho = zero3f;
 	vec3f mfp = { 0.1f, 0.1f, 0.1f };
+	vec3f ns = zero3f;
+	vec3f ss = zero3f;
+	vec3f ts = zero3f;
+	vec3f p = zero3f;
 	float g = 0.0f; // Geometry factor
 	float eta = 0.0f;
 	float rs = 1;          // roughness
+
 	bool refract = false;  // whether to use refraction in transmission
+	BSSRDFTable table = BSSRDFTable(50, 32);
+	//BSSRDFTable * table = new BSSRDFTable(100, 64);
 };
 
-
-bsdf eval_bsdf(const std::shared_ptr<instance>& ist, int ei, const vec2f& uv);
-
-bssrdf eval_bssrdf(const std::shared_ptr<instance>& ist, int ei, const vec2f& uv);
+bssrdf eval_bssrdf(const std::shared_ptr<instance>& ist, int ei, const vec2f& uv, vec3f n, vec3f po, vec3f wo, const ShadingGeometry* sg);
+void ComputeBeamDiffusionBSSRDF(float, float, BSSRDFTable &);
 
 
 bool is_delta_bsdf(const bsdf& f);
@@ -3329,6 +3364,30 @@ void specular_fresnel_from_ks(const vec3f& ks, vec3f& es, vec3f& esk);
 float specular_to_eta(const vec3f& ks);
 // Compute the fresnel term for dielectrics.
 vec3f fresnel_dielectric(float cosw, const vec3f& eta_);
+
+/*
+Taken from PBRT V3
+*/
+float FrDielectric(float cosThetaI, float etaI, float etaT);
+float IntegrateCatmullRom(int n, const float *x, const float *values, float *cdf);
+float BeamDiffusionMS(float sigma_s, float sigma_a, float g, float eta, float r);
+float BeamDiffusionSS(float sigma_s, float sigma_a, float g, float eta, float r);
+void ComputeBeamDiffusionBSSRDF(float g, float eta, BSSRDFTable *t);
+vec3f sample_sp(const std::shared_ptr<scene>& scn, std::string * mat, float u1, vec2f u2, const scene_intersection * si, float * pdf, bssrdf * S);
+float sample_sr(int ch, float u, bssrdf * S);
+float SampleCatmullRom2D(int size1, int size2, const float *nodes1,
+	const float *nodes2, const float *values,
+	const float *cdf, float alpha, float u);
+float sample_sr(int ch, float u, bssrdf * S);
+float Pdf_Sp(const scene_intersection &si, const bssrdf &bssrdf);
+float Pdf_Sr(int ch, float r, const bssrdf &bssrdf);
+vec3f Sr(float r, const bssrdf &bss);
+vec3f Sp(const scene_intersection &pi, const bssrdf &bss);
+/*
+End of PBRT V3 functions
+*/
+
+
 // Compute the fresnel term for metals.
 vec3f fresnel_metal(float cosw, const vec3f& eta, const vec3f& etak);
 // Schlick approximation of Fresnel term, optionally weighted by rs;

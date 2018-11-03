@@ -3873,6 +3873,34 @@ vec3f eval_shading_norm(
     }
 }
 
+// Shading derivatives.
+void eval_shading_geometry(const std::shared_ptr<instance>& ist, int ei, const vec2f & uv, vec3f n, vec3f p, ShadingGeometry * sg){
+			auto uv0 = vec2f{ 0 , 0 };
+			auto uv1 = vec2f{ 1 , 0 };
+			auto uv2 = vec2f{1 , 1 };
+			int a = ist->shp->triangles[ei].x;
+			int b = ist->shp->triangles[ei].y;
+			int c = ist->shp->triangles[ei].z;
+			vec3f p0 = ist->shp->pos[a];
+			vec3f p1 = ist->shp->pos[b];
+			vec3f p2 = ist->shp->pos[c];
+
+			vec2f duv02 = uv0 - uv2;
+			vec2f duv12 = uv1 - uv2;
+
+			vec3f dp02 = p0 - p2;
+			vec3f dp12 = p1 - p2;
+
+			float det = duv02.x * duv12.y - duv02.y * duv12.x;
+			bool degenerateUV = std::abs(det) < 1e-8;
+			if (!degenerateUV) {
+				float invdet = 1 / det;
+				sg->dpdu = (duv12.y * dp02 - duv02.y * dp12) * invdet;
+				sg->dpdv = (-duv12.x * dp02 + duv02.x * dp12) * invdet;
+			}			
+}
+
+
 // Environment texture coordinates from the direction.
 vec2f eval_texcoord(const std::shared_ptr<environment>& env, vec3f w) {
     auto wl = transform_direction_inverse(env->frame, w);
@@ -4059,7 +4087,7 @@ bsdf eval_bsdf(const std::shared_ptr<instance>& ist, int ei, const vec2f& uv) {
 }
 
 // Evaluates the bssrdf at a location.
-bssrdf eval_bssrdf(const std::shared_ptr<instance>& ist, int ei, const vec2f& uv, const vec3f& n, const vec3f&wo) {
+bssrdf eval_bssrdf(const std::shared_ptr<instance>& ist, int ei, const vec2f& uv, vec3f n, vec3f po, vec3f wo, const ShadingGeometry * sg) {
 	auto f = bssrdf();
 	f.kd = eval_diffuse(ist, ei, uv);
 	f.ks = eval_specular(ist, ei, uv);
@@ -4067,19 +4095,36 @@ bssrdf eval_bssrdf(const std::shared_ptr<instance>& ist, int ei, const vec2f& uv
 	f.kr = ist->mat->kr;
 	f.sigma_a = ist->mat->sigma_a;
 	f.sigma_s = ist->mat->sigma_s;
+	f.sigma_t = f.sigma_a + f.sigma_s;
+	f.rho.x = f.sigma_t.x != 0 ? (f.sigma_s.x / f.sigma_t.x) : 0;
+	f.rho.y = f.sigma_t.y != 0 ? (f.sigma_s.y / f.sigma_t.y) : 0;
+	f.rho.z = f.sigma_t.z != 0 ? (f.sigma_s.z / f.sigma_t.z) : 0;
 	f.eta = specular_to_eta(f.ks);
-	auto wi = refract(-wo, n, f.eta);
-	f.g = abs(dot(n, wo))/ abs(dot(n, wo));
+
+	f.p = po;
+	auto wi = -reflect(-wo, n);
+	//std::cout << "wi = " << wi << std::endl;
+	//std::cout << "wo = " << wo << std::endl;
+	f.g = 0.0f;
+	//f.g = abs(dot(n, wo))/ abs(dot(n, -wi));
 	f.mfp = 1.0f / (f.sigma_s + f.sigma_a);
 	f.rs = eval_roughness(ist, ei, uv);
 	f.refract = (ist && ist->mat) ? ist->mat->refract : false;
+	f.ns = sg->sn;
+	f.ss = sg->dpdu;
+	f.ts = cross(f.ns, f.ss);
 	if (f.kd != zero3f) {
 		f.rs = clamp(f.rs, 0.03f * 0.03f, 1.0f);
 	}
 	else if (f.rs <= 0.03f * 0.03f)
 		f.rs = 0;
+	//std::cout << "add2 = " << f.table << std::endl;
+	ComputeBeamDiffusionBSSRDF(f.g, f.eta, f.table);
+	//std::cout << "rs = " << f.table.nRadiusSamples << std::endl;
 	return f;
+
 }
+
 
 
 bool is_delta_bsdf(const bsdf& f) { return f.rs == 0 && f.kd == zero3f; }
@@ -4335,6 +4380,435 @@ vec3f eval_delta_brdf(
     return bsdf;
 }
 
+template <typename Predicate>
+int FindInterval(int size, const Predicate &pred) {
+	int first = 0, len = size;
+	while (len > 0) {
+		int half = len >> 1, middle = first + half;
+		// Bisect range based on value of _pred_ at _middle_
+		if (pred(middle)) {
+			first = middle + 1;
+			len -= half + 1;
+		}
+		else
+			len = half;
+	}
+	return clamp(first - 1, 0, size - 2);
+}
+
+bool CatmullRomWeights(int size, const float *nodes, float x, int *offset,
+	float *weights) {
+	// Return _false_ if _x_ is out of bounds
+	if (!(x >= nodes[0] && x <= nodes[size - 1])) return false;
+
+	// Search for the interval _idx_ containing _x_
+	int idx = FindInterval(size, [&](int i) { return nodes[i] <= x; });
+	*offset = idx - 1;
+	float x0 = nodes[idx], x1 = nodes[idx + 1];
+
+	// Compute the $t$ parameter and powers
+	float t = (x - x0) / (x1 - x0), t2 = t * t, t3 = t2 * t;
+
+	// Compute initial node weights $w_1$ and $w_2$
+	weights[1] = 2 * t3 - 3 * t2 + 1;
+	weights[2] = -2 * t3 + 3 * t2;
+
+	// Compute first node weight $w_0$
+	if (idx > 0) {
+		float w0 = (t3 - 2 * t2 + t) * (x1 - x0) / (x1 - nodes[idx - 1]);
+		weights[0] = -w0;
+		weights[2] += w0;
+	}
+	else {
+		float w0 = t3 - 2 * t2 + t;
+		weights[0] = 0;
+		weights[1] -= w0;
+		weights[2] += w0;
+	}
+
+	// Compute last node weight $w_3$
+	if (idx + 2 < size) {
+		float w3 = (t3 - t2) * (x1 - x0) / (nodes[idx + 2] - x0);
+		weights[1] -= w3;
+		weights[3] = w3;
+	}
+	else {
+		float w3 = t3 - t2;
+		weights[1] -= w3;
+		weights[2] += w3;
+		weights[3] = 0;
+	}
+	return true;
+}
+
+float SampleCatmullRom2D(int size1, int size2, const float *nodes1,
+	const float *nodes2, const float *values,
+	const float *cdf, float alpha, float u) {
+	// Determine offset and coefficients for the _alpha_ parameter
+	int offset;
+	float weights[4];
+	if (!CatmullRomWeights(size1, nodes1, alpha, &offset, weights)) return 0;
+
+	// Define a lambda function to interpolate table entries
+	auto interpolate = [&](const float *array, int idx) {
+		float value = 0;
+		for (int i = 0; i < 4; ++i) {
+			if (weights[i] != 0)
+				value += array[(offset + i) * size2 + idx] * weights[i];
+		}
+		return value;
+	};
+
+	// Map _u_ to a spline interval by inverting the interpolated _cdf_
+	float maximum = interpolate(cdf, size2 - 1);
+	u *= maximum;
+	int idx =
+		FindInterval(size2, [&](int i) { return interpolate(cdf, i) <= u; });
+
+	// Look up node positions and interpolated function values
+	float f0 = interpolate(values, idx), f1 = interpolate(values, idx + 1);
+	float x0 = nodes2[idx], x1 = nodes2[idx + 1];
+	float width = x1 - x0;
+	float d0, d1;
+
+	// Re-scale _u_ using the interpolated _cdf_
+	u = (u - interpolate(cdf, idx)) / width;
+
+	// Approximate derivatives using finite differences of the interpolant
+	if (idx > 0)
+		d0 = width * (f1 - interpolate(values, idx - 1)) /
+		(x1 - nodes2[idx - 1]);
+	else
+		d0 = f1 - f0;
+	if (idx + 2 < size2)
+		d1 = width * (interpolate(values, idx + 2) - f0) /
+		(nodes2[idx + 2] - x0);
+	else
+		d1 = f1 - f0;
+
+	// Invert definite integral over spline segment and return solution
+
+	// Set initial guess for $t$ by importance sampling a linear interpolant
+	float t;
+	if (f0 != f1)
+		t = (f0 - std::sqrt(std::max((float)0, f0 * f0 + 2 * u * (f1 - f0)))) /
+		(f0 - f1);
+	else
+		t = u / f0;
+	float a = 0, b = 1, Fhat, fhat;
+	while (true) {
+		// Fall back to a bisection step when _t_ is out of bounds
+		if (!(t >= a && t <= b)) t = 0.5f * (a + b);
+
+		// Evaluate target function and its derivative in Horner form
+		Fhat = t * (f0 +
+			t * (.5f * d0 +
+				t * ((1.f / 3.f) * (-2 * d0 - d1) + f1 - f0 +
+					t * (.25f * (d0 + d1) + .5f * (f0 - f1)))));
+		fhat = f0 +
+			t * (d0 +
+				t * (-2 * d0 - d1 + 3 * (f1 - f0) +
+					t * (d0 + d1 + 2 * (f0 - f1))));
+
+		// Stop the iteration if converged
+		if (std::abs(Fhat - u) < 1e-6f || b - a < 1e-6f) break;
+
+		// Update bisection bounds using updated _t_
+		if (Fhat - u < 0)
+			a = t;
+		else
+			b = t;
+
+		// Perform a Newton step
+		t -= (Fhat - u) / fhat;
+	}
+
+	return x0 + width * t;
+}
+
+float Pdf_Sr(int ch, float r, const bssrdf &bss) {
+	// Convert $r$ into unitless optical radius $r_{\roman{optical}}$
+	float sigma_ch = ch == 0 ? bss.sigma_t.x : ch == 1 ? bss.sigma_t.y : bss.sigma_t.z;
+	float rho_ch = ch == 0 ? bss.rho.x : ch == 1 ? bss.rho.y : bss.rho.z;
+	float rOptical = r * sigma_ch;
+
+	// Compute spline weights to interpolate BSSRDF density on channel _ch_
+	int rhoOffset, radiusOffset;
+	float rhoWeights[4], radiusWeights[4];
+	if (!CatmullRomWeights(bss.table.nRhoSamples, bss.table.rhoSamples.get(), rho_ch,
+		&rhoOffset, rhoWeights) ||
+		!CatmullRomWeights(bss.table.nRadiusSamples, bss.table.radiusSamples.get(),
+			rOptical, &radiusOffset, radiusWeights))
+		return 0.f;
+
+	// Return BSSRDF profile density for channel _ch_
+	//std::cout << "in = " << std::endl;
+
+	float sr = 0, rhoEff = 0;
+	for (int i = 0; i < 4; ++i) {
+		if (rhoWeights[i] == 0) continue;
+		rhoEff += bss.table.rhoEff[rhoOffset + i] * rhoWeights[i];
+		for (int j = 0; j < 4; ++j) {
+			//std::cout << "radiusWeights[j] = " << radiusWeights[j] << "  bss.table->EvalProfile(rhoOffset + i, radiusOffset + j) = " << bss.table->EvalProfile(rhoOffset + i, radiusOffset + j) << " rhoWeights[i] = " << rhoWeights[i] << " radiusWeights[j]" << radiusWeights[j] << std::endl;
+
+			if (radiusWeights[j] == 0) continue;
+			sr += bss.table.EvalProfile(rhoOffset + i, radiusOffset + j) *
+				rhoWeights[i] * radiusWeights[j];
+		}
+	}
+
+	// Cancel marginal PDF factor from tabulated BSSRDF profile
+	if (rOptical != 0) sr /= 2 * pi * rOptical;
+	//std::cout << "sr * sigma_ch * sigma_ch / rhoEff =  " << sr * sigma_ch * sigma_ch / rhoEff << std::endl;
+	return std::max((float)0, sr * sigma_ch * sigma_ch / rhoEff);
+}
+
+float Pdf_Sp(scene_intersection &pi, const bssrdf &bss) {
+	// Express $\pti-\pto$ and $\bold{n}_i$ with respect to local coordinates at
+	// $\pto$
+
+
+	auto pos = eval_pos(pi.ist, pi.ei, pi.uv);
+	auto norm = eval_norm(pi.ist, pi.ei, pi.uv);
+
+	vec3f d = bss.p - pos;
+	vec3f dLocal(dot(bss.ss, d), dot(bss.ts, d), dot(bss.ns, d));
+	vec3f nLocal(dot(bss.ss, norm), dot(bss.ts, norm), dot(bss.ns, norm));
+
+	// Compute BSSRDF profile radius under projection along each axis
+	float rProj[3] = { std::sqrt(dLocal.y * dLocal.y + dLocal.z * dLocal.z),
+		std::sqrt(dLocal.z * dLocal.z + dLocal.x * dLocal.x),
+		std::sqrt(dLocal.x * dLocal.x + dLocal.y * dLocal.y) };
+
+	// Return combined probability from all BSSRDF sampling strategies
+	float pdf = 0;
+	float axisProb[3] = { .25f, .25f, .5f };
+	float chProb = 1 / (float) 3;
+	float nlocal_arr[3] = { nLocal.x, nLocal.y, nLocal.z};
+
+	for (int axis = 0; axis < 3; ++axis)
+		for (int ch = 0; ch < 3; ++ch) {
+			//std::cout << "pdf sr = " << Pdf_Sr(ch, rProj[axis], bss) << " abs = " << std::abs(nlocal_arr[axis]) << " chProb = " << chProb << " axisProb[axis]" << axisProb[axis] << std::endl;
+
+			pdf += Pdf_Sr(ch, rProj[axis], bss) * 0.3 * chProb *
+				//pdf += Pdf_Sr(ch, rProj[axis], bss) * std::abs(nlocal_arr[axis]) * chProb *
+				axisProb[axis];
+			//std::cout << "pdf = " <<pdf << std::endl;
+		}
+	//std::cout << "pdf_sp= " << pdf << std::endl;
+
+	return pdf;
+}
+
+float sample_sr(int ch, float u, bssrdf * S) {
+	float rho = (ch == 0) ? S->rho.x : (ch == 1) ? S->rho.y : S->rho.z;
+	float sigma_t = (ch == 0) ? S->sigma_t.x : (ch == 1) ? S->sigma_t.y : S->sigma_t.z;
+
+	if ((S->sigma_t.x == 0 && ch == 0) || (S->sigma_t.y == 0 && ch == 1) || (S->sigma_t.z == 0 && ch == 2)) {
+		return -1;
+	}
+	else {
+		return SampleCatmullRom2D(S->table.nRhoSamples, S->table.nRadiusSamples,
+			S->table.rhoSamples.get(), S->table.radiusSamples.get(), S->table.profile.get(),
+			S->table.profileCDF.get(), rho, u) / sigma_t;
+	}
+}
+
+
+vec3f Sr(float r, const bssrdf &bss) {
+
+	float sr_value[3] = {0.0f, 0.0f, 0.0f};
+
+	float sigma_t[3] = { bss.sigma_t.x, bss.sigma_t.y , bss.sigma_t.z };
+	float rho[3] = { bss.rho.x, bss.rho.y , bss.rho.z };
+
+	for (int ch = 0; ch < 3; ++ch) {
+		// Convert $r$ into unitless optical radius $r_{\roman{optical}}$
+		float rOptical = r * sigma_t[ch];
+		//std::cout << "rOptical = " << rOptical << std::endl;
+
+
+		// Compute spline weights to interpolate BSSRDF on channel _ch_
+		int rhoOffset, radiusOffset;
+		float rhoWeights[4], radiusWeights[4];
+		if (!CatmullRomWeights(bss.table.nRhoSamples, bss.table.rhoSamples.get(),
+			rho[ch], &rhoOffset, rhoWeights) ||
+			!CatmullRomWeights(bss.table.nRadiusSamples, bss.table.radiusSamples.get(),
+				rOptical, &radiusOffset, radiusWeights))
+			continue;
+
+		// Set BSSRDF value _Sr[ch]_ using tensor spline interpolation
+		float sr = 0;
+		for (int i = 0; i < 4; ++i) {
+			for (int j = 0; j < 4; ++j) {
+				float weight = rhoWeights[i] * radiusWeights[j];
+				if (weight != 0)
+					sr += weight *
+					bss.table.EvalProfile(rhoOffset + i, radiusOffset + j);
+					//std::cout << "EvalProfile = " << bss.table->EvalProfile(rhoOffset + i, radiusOffset + j) << std::endl;
+
+			}
+		}
+
+		// Cancel marginal PDF factor from tabulated BSSRDF profile
+		if (rOptical != 0) sr /= 2 * pi * rOptical;
+		sr_value[ch] = sr;
+	}
+	// Transform BSSRDF value into world space units
+	vec3f sr_value_v = { sr_value[0], sr_value[1], sr_value[2] };
+	//std::cout << "sr_bf = " << sr_value_v << std::endl;
+
+	sr_value_v *= bss.sigma_t * bss.sigma_t;
+
+	//std::cout << "eta = " << bss.eta << std::endl;
+	//std::cout << "sigmat = " << bss.sigma_t << std::endl;
+	//std::cout << "g = " << bss.g << std::endl;
+	
+	
+	return sr_value_v;
+}
+
+vec3f Sp(scene_intersection &pi, const bssrdf &bss) {
+	auto pos = eval_pos(pi.ist, pi.ei, pi.uv);
+	return Sr(length(bss.p - pos), bss);
+}
+
+
+vec3f sample_sp(const std::shared_ptr<scene>& scn, std::string * mat,float u1, vec2f u2, scene_intersection * si, float * pdf, bssrdf * S) {
+	vec3f vx, vy, vz;
+	if (u1 < 0.5f) {
+		vx = S->ss;
+		vy = S->ts;
+		vz = S->ns;
+		u1 *= 2;
+	}
+	else if (u1 < 0.75f) {
+		vx = S->ts;
+		vy = S->ns;
+		vz = S->ss;
+		u1 = (u1 - 0.5f) * 4;
+	}
+	else {
+		vx = S->ns;
+		vy = S->ss;
+		vz = S->ts;
+		u1 = (u1 - 0.75f) * 4;
+	}
+
+	//Choose channel for BSSRDF sample
+	int ch = clamp((int)(u1 * 3), 0, 2);
+	u1 = u1 * 3 - ch;
+
+
+	//Sample BSSRDF in polar coordinates
+	float r = sample_sr(ch, u2.x, S);
+
+	if (r < 0) {
+		return zero3f;
+	}
+	float phi = 2 * pi * u2.y;
+
+	//Compute bounds and intersect height
+	float r_max = sample_sr(ch, 0.999f, S);
+
+	float l = 2 * sqrt(r_max * r_max - r * r);
+
+	// Compute BSSRDF sampling ray segment
+	auto mat_source = *mat;
+	/*std::cout << "r " << r << std::endl;
+	std::cout << "r max " << r_max << std::endl;
+	std::cout << "l " << r << std::endl;
+
+	std::cout << "name " << mat_source <<std::endl;*/
+
+	auto p_source = S->p + r * (vx * cos(phi) + vy * sin(phi) - l * vz * 0.5f);
+	//std::cout << "orig =  " << S->p << std::endl;
+	//std::cout << "p_source =  " << p_source << std::endl;
+
+	auto p_target = p_source + l * vz;
+	//std::cout << "targ =  " << p_target << std::endl;
+
+	struct IntersectionChain {
+		scene_intersection si;
+		vec3f pos;
+		IntersectionChain *next = nullptr;
+	};
+
+	IntersectionChain * chain = new(IntersectionChain);
+	IntersectionChain * chain_head = chain;
+
+	int nFound = 0;
+	//std::cout << "before" << std::endl;
+	while (true && nFound < 10) {
+		auto r = make_ray(p_source, p_target-p_source);
+		//std::cout << "source " << p_source << std::endl;
+		//std::cout << "target " << p_target << std::endl;
+		//std::cout << "ray d  " << r.d << std::endl;
+
+		auto isec = intersect_ray(scn, r);
+		if (!(isec.ist) || r.d == zero3f) {
+			break;
+		}
+		auto new_p = eval_pos(isec.ist, isec.ei, isec.uv);
+
+		chain_head->si = isec;
+		chain_head->pos = new_p;
+		p_source = new_p;
+
+		if (isec.ist->mat->name == mat_source) {
+			IntersectionChain * next = new(IntersectionChain);
+			chain_head->next = next;
+			chain_head = next;
+			nFound++;
+			//std::cout << "found ss path" << std::endl;
+			//std::cout << "mat = " << isec.ist->mat->name << std::endl;
+			//std::cout << "found " << nFound<<std::endl;
+		}
+		else {
+			break;
+		}
+		//std::cout << "nfound = " <<nFound<<" " <<isec.ist->mat->name <<" = " << mat_source << std::endl;
+
+	}
+	//std::cout << "out" << std::endl;
+
+	//std::cout << "out " << std::endl;
+	// Randomly choose one of several intersections during BSSRDF sampling
+	//std::cout << "nFound = " << nFound << std::endl;
+
+	if (nFound == 0) return zero3f;
+	int selected = clamp((int) u1 * nFound, 0, nFound -1);
+	for (int i = selected; i > 0; --i) {
+		chain = chain->next;
+	}
+	auto c = chain->si;
+	*si = c;
+	//std::cout << "found ss path of size: " << nFound << std::endl;
+	//std::cout << "chain si shp= : " << chain->si.ist->name << std::endl;
+
+//	std::cout << "selected : " << selected << std::endl;
+
+
+	// Compute sample PDF and return the spatial BSSRDF term $\Sp$
+    //std::cout << "pdf a = " << *pdf << std::endl;
+
+	*pdf = Pdf_Sp(c, *S) / nFound;
+	//std::cout << "pdf b = " << *pdf << std::endl;
+
+	return Sp(c, *S);
+}
+
+
+
+
+vec3f sample_bssrdf(const std::shared_ptr<scene>& scn, std::string * mat, float u1, vec2f u2, scene_intersection * pi, float * pdf, bssrdf * S) {
+	//std::cout << "in" << std::endl;
+	auto sp = sample_sp(scn, mat,  u1, u2, pi, pdf, S);
+	//std::cout << "out = " << std::endl;
+	return sp;
+}
+
+
 // Picks a direction based on the BRDF
 vec3f sample_brdf(
     const bsdf& f, const vec3f& n, const vec3f& o, float rnl, const vec2f& rn) {
@@ -4547,7 +5021,6 @@ vec3f trace_path(const std::shared_ptr<scene>& scn, const ray3f& ray_,
         auto p = eval_pos(isec.ist, isec.ei, isec.uv);
         auto n = eval_shading_norm(isec.ist, isec.ei, isec.uv, o);
         auto f = eval_bsdf(isec.ist, isec.ei, isec.uv);
-		auto S = eval_bssrdf(isec.ist, isec.ei, isec.uv, n, o);
 
         // emission
         if (emission) l += weight * eval_emission(isec.ist, isec.ei, isec.uv);
@@ -4621,10 +5094,80 @@ vec3f trace_path(const std::shared_ptr<scene>& scn, const ray3f& ray_,
         emission = is_delta_bsdf(f);
 
 		//Here goes subsurface scattering
-		/*
+		/**/
+		if (isec.ist->mat->name == "obj2") {
+		//if (false) {
+
+		//if (false) {
+			ShadingGeometry sg;
+			eval_shading_geometry(isec.ist, isec.ei, isec.uv, n, p, &sg);
+			auto S = eval_bssrdf(isec.ist, isec.ei, isec.uv, n, p, o, &sg);
+
+			//std::cout << "mat name = " << isec.ist->mat->name << std::endl;
+			//std::cout << " bssrdf -- sigma_a = " << S.sigma_a << " sigma_s = " << S.sigma_s << std::endl;
+			scene_intersection pi = scene_intersection();
+			//std::cout << "pdf before = " << pdf << std::endl;
+			//std::cout << "in" << std::endl;
+
+			vec3f bss = sample_bssrdf(scn, &isec.ist->mat->name,rand1f(rng), rand2f(rng), &pi, &pdf, &S);
+			//std::cout << "pdf after = " << pdf<< std::endl;
+			//std::cout << "bss after = " << bss << std::endl;
+
+
+			if (bss == zero3f || pdf == 0) {
+				break;
+			}
+			weight *= bss / pdf;
+
+
+			auto f = eval_bsdf(pi.ist, pi.ei, pi.uv);
+			auto n = eval_norm(pi.ist, pi.ei, pi.uv);
+			auto o = -ray.d;
+			auto p = eval_pos(pi.ist, pi.ei, pi.uv);
+
+			// direct
+			if (!is_delta_bsdf(f) && (!scn->lights.empty() || !scn->environments.empty())) {
+				auto i = zero3f;
+				auto nlights = (int)(scn->lights.size() + scn->environments.size());
+				if (rand1f(rng) < 0.5f) {
+					auto idx = sample_index(nlights, rand1f(rng));
+					if (idx < scn->lights.size()) {
+						auto lgt = scn->lights[idx];
+						i = sample_light(lgt, p, rand1f(rng), rand2f(rng));
+					}
+					else {
+						auto env = scn->environments[idx - scn->lights.size()];
+						i = sample_environment(env, rand1f(rng), rand2f(rng));
+					}
+				}
+				else {
+					i = sample_brdf(f, n, o, rand1f(rng), rand2f(rng));
+				}
+				auto isec =
+					intersect_ray_cutout(scn, make_ray(p, i), rng, nbounces);
+				auto pdf = 0.5f * sample_brdf_pdf(f, n, o, i);
+				auto le = zero3f;
+				if (isec.ist) {
+					auto lp = eval_pos(isec.ist, isec.ei, isec.uv);
+					auto ln = eval_shading_norm(isec.ist, isec.ei, isec.uv, -i);
+					pdf += 0.5f * sample_light_pdf(isec.ist, p, i, lp, ln) *
+						sample_index_pdf<float>(nlights);
+					le += eval_emission(isec.ist, isec.ei, isec.uv);
+				}
+				else {
+					for (auto env : scn->environments) {
+						pdf += 0.5f * sample_environment_pdf(env, i) *
+							sample_index_pdf<float>(nlights);
+						le += eval_environment(env, i);
+					}
+				}
+				auto brdfcos = eval_bsdf(f, n, o, i) * fabs(dot(n, i));
+				if (pdf != 0) l += weight * le * brdfcos / pdf;
+			}
+
+			
+		}
 		
-		
-		*/
     }
 
     return l;
@@ -5230,7 +5773,10 @@ bool trace_samples(trace_state& st, const std::shared_ptr<scene>& scn,
     nbatch = min(nbatch, nsamples - st.sample);
     if (noparallel) {
         for (auto j = 0; j < imsize.y; j++) {
+			std::cout << "j = " << j << std::endl;
             for (auto i = 0; i < imsize.x; i++) {
+				std::cout << "i = " << i << std::endl;
+
                 for (auto s = 0; s < nbatch; s++)
                     st.acc[{i, j}] += trace_sample(scn, cam, {i, j}, imsize,
                         st.rng[{i, j}], tracer, nbounces, pixel_clamp);
@@ -5243,8 +5789,15 @@ bool trace_samples(trace_state& st, const std::shared_ptr<scene>& scn,
         auto threads = std::vector<std::thread>();
         for (auto tid = 0; tid < std::thread::hardware_concurrency(); tid++) {
             threads.push_back(std::thread([=, &st]() {
+
                 for (auto j = tid; j < imsize.y; j += nthreads) {
+					std::cout << "j = " << j << std::endl;
+
                     for (auto i = 0; i < imsize.x; i++) {
+						std::cout << "i = " << i << std::endl;
+
+
+
                         for (auto s = 0; s < nbatch; s++)
                             st.acc[{i, j}] += trace_sample(scn, cam, {i, j},
                                 imsize, st.rng[{i, j}], tracer, nbounces,
@@ -5351,6 +5904,33 @@ float specular_to_eta(const vec3f& ks) {
     return (1 + sqrt(f0)) / (1 - sqrt(f0));
 }
 
+// BSSRDF Utility Functions
+float FresnelMoment1(float eta) {
+	float eta2 = eta * eta, eta3 = eta2 * eta, eta4 = eta3 * eta,
+		eta5 = eta4 * eta;
+	if (eta < 1)
+		return 0.45966f - 1.73965f * eta + 3.37668f * eta2 - 3.904945 * eta3 +
+		2.49277f * eta4 - 0.68441f * eta5;
+	else
+		return -4.61686f + 11.1136f * eta - 10.4646f * eta2 + 5.11455f * eta3 -
+		1.27198f * eta4 + 0.12746f * eta5;
+}
+
+float FresnelMoment2(float eta) {
+	float eta2 = eta * eta, eta3 = eta2 * eta, eta4 = eta3 * eta,
+		eta5 = eta4 * eta;
+	if (eta < 1) {
+		return 0.27614f - 0.87350f * eta + 1.12077f * eta2 - 0.65095f * eta3 +
+			0.07883f * eta4 + 0.04860f * eta5;
+	}
+	else {
+		float r_eta = 1 / eta, r_eta2 = r_eta * r_eta, r_eta3 = r_eta2 * r_eta;
+		return -547.033f + 45.3087f * r_eta3 - 218.725f * r_eta2 +
+			458.843f * r_eta + 404.557f * eta - 189.519f * eta2 +
+			54.9327f * eta3 - 9.00603f * eta4 + 0.63942f * eta5;
+	}
+}
+
 // Compute the fresnel term for dielectrics. Implementation from
 // https://seblagarde.wordpress.com/2013/04/29/memo-on-fresnel-equations/
 vec3f fresnel_dielectric(float cosw, const vec3f& eta_) {
@@ -5436,5 +6016,206 @@ vec3f sample_ggx(float rs, const vec2f& rn) {
     auto wh_local = vec3f{rr * cos(rphi), rr * sin(rphi), rz};
     return wh_local;
 }
+
+// BxDF Utility Functions
+float FrDielectric(float cosThetaI, float etaI, float etaT) {
+	cosThetaI = clamp(cosThetaI, -1.0f, 1.0f);
+	// Potentially swap indices of refraction
+	bool entering = cosThetaI > 0.f;
+	if (!entering) {
+		std::swap(etaI, etaT);
+		cosThetaI = std::abs(cosThetaI);
+	}
+
+	// Compute _cosThetaT_ using Snell's law
+	float sinThetaI = std::sqrt(std::max((float)0, 1 - cosThetaI * cosThetaI));
+	float sinThetaT = etaI / etaT * sinThetaI;
+
+	// Handle total internal reflection
+	if (sinThetaT >= 1) return 1;
+	float cosThetaT = std::sqrt(std::max((float)0, 1 - sinThetaT * sinThetaT));
+	float Rparl = ((etaT * cosThetaI) - (etaI * cosThetaT)) /
+		((etaT * cosThetaI) + (etaI * cosThetaT));
+	float Rperp = ((etaI * cosThetaI) - (etaT * cosThetaT)) /
+		((etaI * cosThetaI) + (etaT * cosThetaT));
+	return (Rparl * Rparl + Rperp * Rperp) / 2;
+}
+
+// Media Inline Functions
+inline float PhaseHG(float cosTheta, float g) {
+	float inv4Pi = 0.07957747154594766788;
+	float denom = 1 + g * g + 2 * g * cosTheta;
+	return inv4Pi * (1 - g * g) / (denom * std::sqrt(denom));
+}
+
+
+float IntegrateCatmullRom(int n, const float *x, const float *values,
+	float *cdf) {
+	float sum = 0;
+	cdf[0] = 0;
+	for (int i = 0; i < n - 1; ++i) {
+		// Look up $x_i$ and function values of spline segment _i_
+		float x0 = x[i], x1 = x[i + 1];
+		float f0 = values[i], f1 = values[i + 1];
+		float width = x1 - x0;
+
+		// Approximate derivatives using finite differences
+		float d0, d1;
+		if (i > 0)
+			d0 = width * (f1 - values[i - 1]) / (x1 - x[i - 1]);
+		else
+			d0 = f1 - f0;
+		if (i + 2 < n)
+			d1 = width * (values[i + 2] - f0) / (x[i + 2] - x0);
+		else
+			d1 = f1 - f0;
+
+		// Keep a running sum and build a cumulative distribution function
+		sum += ((d0 - d1) * (1.f / 12.f) + (f0 + f1) * .5f) * width;
+
+		cdf[i + 1] = sum;
+		if (cdf[i + 1]) {
+			//std::cout << "cdf" <<  cdf[i + 1] << std::endl;
+		}
+	}
+	return sum;
+}
+
+float BeamDiffusionMS(float sigma_s, float sigma_a, float g, float eta,
+	float r) {
+	const int nSamples = 100;
+	float Ed = 0;
+	float Inv4Pi = 0.07957747154594766788;
+		// Precompute information for dipole integrand
+
+		// Compute reduced scattering coefficients $\sigmaps, \sigmapt$ and albedo
+		// $\rhop$
+	float sigmap_s = sigma_s * (1 - g);
+	float sigmap_t = sigma_a + sigmap_s;
+	float rhop = sigmap_s / sigmap_t;
+
+	// Compute non-classical diffusion coefficient $D_\roman{G}$ using
+	// Equation (15.24)
+	float D_g = (2 * sigma_a + sigmap_s) / (3 * sigmap_t * sigmap_t);
+
+	// Compute effective transport coefficient $\sigmatr$ based on $D_\roman{G}$
+	float sigma_tr = std::sqrt(sigma_a / D_g);
+
+	// Determine linear extrapolation distance $\depthextrapolation$ using
+	// Equation (15.28)
+	float fm1 = FresnelMoment1(eta), fm2 = FresnelMoment2(eta);
+	float ze = -2 * D_g * (1 + 3 * fm2) / (1 - 2 * fm1);
+
+	// Determine exitance scale factors using Equations (15.31) and (15.32)
+	float cPhi = .25f * (1 - 2 * fm1), cE = .5f * (1 - 3 * fm2);
+	for (int i = 0; i < nSamples; ++i) {
+		// Sample real point source depth $\depthreal$
+		float zr = -std::log(1 - (i + .5f) / nSamples) / sigmap_t;
+
+		// Evaluate dipole integrand $E_{\roman{d}}$ at $\depthreal$ and add to
+		// _Ed_
+		float zv = -zr + 2 * ze;
+		float dr = std::sqrt(r * r + zr * zr), dv = std::sqrt(r * r + zv * zv);
+
+		// Compute dipole fluence rate $\dipole(r)$ using Equation (15.27)
+		float phiD = Inv4Pi / D_g * (std::exp(-sigma_tr * dr) / dr -
+			std::exp(-sigma_tr * dv) / dv);
+
+		// Compute dipole vector irradiance $-\N{}\cdot\dipoleE(r)$ using
+		// Equation (15.27)
+		float EDn = Inv4Pi * (zr * (1 + sigma_tr * dr) *
+			std::exp(-sigma_tr * dr) / (dr * dr * dr) -
+			zv * (1 + sigma_tr * dv) *
+			std::exp(-sigma_tr * dv) / (dv * dv * dv));
+
+		// Add contribution from dipole for depth $\depthreal$ to _Ed_
+		float E = phiD * cPhi + EDn * cE;
+		float kappa = 1 - std::exp(-2 * sigmap_t * (dr + zr));
+		Ed += kappa * rhop * rhop * E;
+	}
+	return Ed / nSamples;
+}
+
+float BeamDiffusionSS(float sigma_s, float sigma_a, float g, float eta,
+	float r) {
+	// Compute material parameters and minimum $t$ below the critical angle
+	float sigma_t = sigma_a + sigma_s, rho = sigma_s / sigma_t;
+	float tCrit = r * std::sqrt(eta * eta - 1);
+	float Ess = 0;
+	const int nSamples = 100;
+	for (int i = 0; i < nSamples; ++i) {
+		// Evaluate single scattering integrand and add to _Ess_
+		float ti = tCrit - std::log(1 - (i + .5f) / nSamples) / sigma_t;
+
+		// Determine length $d$ of connecting segment and $\cos\theta_\roman{o}$
+		float d = std::sqrt(r * r + ti * ti);
+		float cosThetaO = ti / d;
+		/*
+		// Add contribution of single scattering at depth $t$
+		std::cout << "PhaseHG(cosThetaO, g) = " << PhaseHG(cosThetaO, g) << std::endl;
+		std::cout << "FrDielectric(-cosThetaO, 1, eta) = " << FrDielectric(-cosThetaO, 1, eta) << std::endl;
+		std::cout << "rho = " << rho << std::endl;
+		std::cout << "d = " << d << std::endl;
+		std::cout << "g = " << g << std::endl;
+		*/
+		Ess += rho * std::exp(-sigma_t * (d + tCrit)) / (d * d) *
+			PhaseHG(cosThetaO, g) * (1 - FrDielectric(-cosThetaO, 1, eta)) *
+			std::abs(cosThetaO);
+	}
+	//std::cout << "Ess = " << Ess << std::endl;
+
+	return Ess / nSamples;
+}
+
+void ComputeBeamDiffusionBSSRDF(float g, float eta, BSSRDFTable &t) {
+
+	// Choose radius values of the diffusion profile discretization
+	t.radiusSamples[0] = 0;
+	t.radiusSamples[1] = 2.5e-3f;
+	for (int i = 2; i < t.nRadiusSamples; ++i)
+		t.radiusSamples[i] = t.radiusSamples[i - 1] * 1.2f;
+	// Choose albedo values of the diffusion profile discretization
+	for (int i = 0; i < t.nRhoSamples; ++i) {
+		t.rhoSamples[i] =
+			(1 - std::exp(-8 * i / (float)(t.nRhoSamples - 1))) /
+			(1 - std::exp(-8));
+
+		// Compute the diffusion profile for the _i_th albedo sample
+
+		// Compute scattering profile for chosen albedo $\rho$
+		for (int j = 0; j < t.nRadiusSamples; ++j) {
+			float rho = t.rhoSamples[i], r = t.radiusSamples[j];
+			t.profile[i * t.nRadiusSamples + j] =
+				2 * pi * r * (BeamDiffusionSS(rho, 1 - rho, g, eta, r) +
+					BeamDiffusionMS(rho, 1 - rho, g, eta, r));
+
+			// Compute effective albedo $\rho_{\roman{eff}}$ and CDF for importance
+			// sampling
+
+			t.rhoEff[i] =
+				IntegrateCatmullRom(t.nRadiusSamples, t.radiusSamples.get(),
+					&t.profile[i * t.nRadiusSamples],
+					&t.profileCDF[i * t.nRadiusSamples]);
+		}
+	}
+	//for (int i = 2; i < t.nRhoSamples; ++i)
+		//std::cout << "rs " << i << " = " << t.rhoSamples[i] << std::endl;
+	//for (int i = 1; i < t.nRadiusSamples * t.nRhoSamples; ++i) {
+	//	if (t.profileCDF[i])
+		//	std::cout << "cdf" << t.profileCDF[i] << std::endl;
+	//}
+}
+
+// BSSRDF Method Definitions
+BSSRDFTable::BSSRDFTable(int nRhoSamples, int nRadiusSamples)
+	: nRhoSamples(nRhoSamples),
+	nRadiusSamples(nRadiusSamples),
+	rhoSamples(new float[nRhoSamples]),
+	radiusSamples(new float[nRadiusSamples]),
+	profile(new float[nRadiusSamples * nRhoSamples]),
+	rhoEff(new float[nRhoSamples]),
+	profileCDF(new float[nRadiusSamples * nRhoSamples]) {}
+
+
 
 }  // namespace ygl
